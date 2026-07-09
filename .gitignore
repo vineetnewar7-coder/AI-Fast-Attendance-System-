@@ -1,0 +1,17 @@
+# Pickle files (encodings)
+*.pkl
+
+# Python system folders
+__pycache__/
+
+# Environment and Secret files
+.env
+.streamlit/
+
+# Text files (if they contain local logs or history)
+*.txt
+
+# IDE settings(If you use VSCode or IntelliJ)
+.vscode/
+.idea/
+
