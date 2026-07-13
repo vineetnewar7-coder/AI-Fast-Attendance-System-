@@ -77,7 +77,7 @@ if st.sidebar.button("🚪 Logout"):
 
 st.sidebar.markdown("---")
 page = st.sidebar.radio("📌 Navigation",[
-    "👥 Manage Students","📚 Manage Subjects","📊 History & Reports"
+    "👥 Manage Students","📚 Manage Subjects","📊 History & Reports","🛠️ Recruiter Demo Tools"
 ])
 
 # Student directory and registration interface
@@ -167,3 +167,74 @@ elif page=="📊 History & Reports":
         st.dataframe(df_h.style.map(ui._badge,subset=['Status']),use_container_width=True,hide_index=True)
         st.download_button("⬇️ Download CSV",df_h.to_csv(index=False).encode(),
                            f"attendance_{hs}_{hd}.csv","text/csv")
+
+# Recruiter & Demo Simulator Section
+elif page == "🛠️ Recruiter Demo Tools":
+    st.title("🛠️ Recruiter Demo Tools")
+    st.markdown("""
+    Welcome to the **Developer Demo Control Panel**. Since this cloud-deployed web app is an administration panel 
+    and doesn't directly run a physical camera, you can use these tools to simulate the entire end-to-end pipeline 
+    (Database insertions, real-time status updates, and WhatsApp notifications).
+    """)
+    st.markdown("---")
+    
+    c1, c2 = st.columns([1, 1])
+    
+    with c1:
+        st.subheader("1. Populate PostgreSQL with Mock Data")
+        st.write("Clicking this button will seed your Neon PostgreSQL tables with a list of mock students, courses, and generated attendance logs. This lets you inspect populated data in other tabs immediately.")
+        if st.button("📥 Seeding Mock Database", use_container_width=True):
+            with st.spinner("Populating tables..."):
+                ok, msg = database.generate_mock_data(tid)
+                if ok:
+                    st.success(msg)
+                    st.session_state.pop("att_df", None)
+                else:
+                    st.error(msg)
+    
+    with c2:
+        st.subheader("2. Simulate Face Match & Twilio Alerts")
+        st.write("Select a registered student and subject below to manually simulate a successful face recognition match. This will mark the student **Present** in the database and trigger a real WhatsApp alert using Twilio.")
+        
+        df_s = database.get_students(tid)
+        subs = database.get_subjects(tid)
+        
+        if df_s.empty or not subs:
+            st.warning("⚠️ Please populate mock data first using the left panel or register a student/subject.")
+        else:
+            student_list = []
+            for idx, r in df_s.iterrows():
+                student_list.append(f"{r['Name']} (Roll: {r['Roll']})")
+            
+            sel_student = st.selectbox("Select Student to Simulate", student_list)
+            sel_sub = st.selectbox("Select Subject", subs)
+            
+            # Extract raw parameters safely
+            try:
+                roll_part = sel_student.split("(Roll: ")[1].replace(")", "").strip()
+                name_part = sel_student.split(" (Roll:")[0].strip()
+            except IndexError:
+                roll_part = ""
+                name_part = ""
+            
+            if st.button("⚡ Trigger Swipe & Send WhatsApp Alert", use_container_width=True):
+                if roll_part and sel_sub:
+                    with st.spinner("Processing trigger..."):
+                        label_format = f"{name_part.replace(' ', '_')}_{roll_part}"
+                        
+                        sk = f"done_{sel_sub}_{roll_part}"
+                        st.session_state.pop(sk, None)
+                        
+                        ok, phone = database.mark_present(tid, sel_sub, label_format)
+                        if ok:
+                            st.success(f"🎯 Successfully marked {name_part} (Roll: {roll_part}) as PRESENT!")
+                            st.session_state.att_df = database.load_attendance(tid, sel_sub)
+                            if phone:
+                                st.session_state.wa_q.put((phone, name_part, sel_sub, tid, label_format))
+                                st.info(f"📨 WhatsApp alert queued for registered parent number: `{phone}`")
+                            else:
+                                st.warning("⚠️ Attendance marked, but no phone number found or message already dispatched.")
+                        else:
+                            st.warning("ℹ️ Already marked Present for this subject today.")
+                else:
+                    st.error("Error parsing student parameters.")
