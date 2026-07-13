@@ -358,4 +358,31 @@ def mark_present(tid, subject, label):
         with conn.cursor() as c:
             c.execute("""INSERT INTO attendance_log(student_id,date,subject,status,marked_at,message_sent)
                          VALUES(%s,%s,%s,'P',NOW(),FALSE)
-                         ON CONFLICT(studen
+                         ON CONFLICT(student_id,date,subject)
+                         DO UPDATE SET status='P', marked_at=NOW()""",
+                      (sid, today, subject))
+        conn.commit()
+        st.session_state[sk] = True
+        notify = not (ex and ex[1])
+        return True, (phone if notify else None)
+    except Exception as e:
+        print(f"[mark_present] {e}"); return False, None
+    finally: conn.close()
+
+def flag_msg_sent(tid, subject, label):
+    _exec("""UPDATE attendance_log SET message_sent=TRUE WHERE date=%s AND subject=%s
+             AND student_id=(SELECT id FROM students WHERE tenant_id=%s AND roll_number=%s)""",
+          (datetime.date.today(), subject, tid, _roll(label)), commit=True)
+
+def load_history(tid, date, subject):
+    conn = get_conn()
+    if not conn: return pd.DataFrame()
+    try:
+        return pd.read_sql_query("""
+            SELECT s.name AS "Name", s.roll_number AS "Roll",
+                   COALESCE(a.status,'A') AS "Status", a.marked_at AS "Marked At"
+            FROM   students s
+            LEFT JOIN attendance_log a ON a.student_id=s.id AND a.date=%s AND a.subject=%s
+            WHERE  s.tenant_id=%s ORDER BY s.name
+        """, conn, params=(date, subject, tid))
+    finally: conn.close()
