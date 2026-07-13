@@ -4,7 +4,6 @@ import psycopg2, psycopg2.extras
 import pandas as pd
 import streamlit as st
 import config
-import face_logic
 
 # TCP keepalives and sequential SSL mode fallbacks are configured below.
 # This prevents serverless Neon DB instances from closing idle connections during cold starts.
@@ -188,25 +187,8 @@ def save_student(tid, name, roll, phone=""):
     return (True,"Saved!") if ok is not None else (False,"DB error")
 
 def del_student(tid, roll):
+    """Deletes a student record safely from the cloud database without managing local file deletion."""
     roll = str(roll).strip()
-    img_dir = face_logic._img_dir(tid)
-    if os.path.exists(img_dir):
-        for f in os.listdir(img_dir):
-            if f.lower().endswith(('.jpg', '.jpeg', '.png')):
-                lbl = os.path.splitext(f)[0]
-                if _roll(lbl) == roll:
-                    try:
-                        os.remove(os.path.join(img_dir, f))
-                    except OSError:
-                        pass
-    ep = face_logic._enc_path(tid)
-    if os.path.exists(ep):
-        try:
-            os.remove(ep)
-        except OSError:
-            pass
-    for k in [f"enc_{tid}", f"nam_{tid}", f"np_{tid}"]:
-        st.session_state.pop(k, None)
     _exec("DELETE FROM students WHERE tenant_id=%s AND roll_number=%s",
           (tid, roll), commit=True)
 
