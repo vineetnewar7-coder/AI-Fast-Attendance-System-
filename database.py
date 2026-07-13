@@ -51,7 +51,6 @@ def show_auth():
                     ok,msg=database.tenant_register(rn,rc,rp); (st.success if ok else st.error)(msg)
 
 # Setup schemas and check application credentials
-database.init_db()
 
 if "tenant" not in st.session_state:
     show_auth(); st.stop()
