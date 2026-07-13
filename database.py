@@ -1,247 +1,361 @@
-import logging, warnings
-logging.getLogger("streamlit").setLevel(logging.ERROR)
-warnings.filterwarnings("ignore", category=UserWarning)
-
-import streamlit as st
-st.set_page_config(page_title="Attendance Admin Portal", layout="wide")
-
-import os, time, base64, threading, queue
+import os
+import datetime, hashlib
+import psycopg2, psycopg2.extras
 import pandas as pd
-import datetime
-
+import streamlit as st
 import config
-import database
-import notifications
-import ui
 
-# Initialize a thread-safe Queue and worker for Twilio messaging.
-# Running this as a daemon thread prevents notification delays from blocking the UI.
-if "wa_q" not in st.session_state:
-    st.session_state.wa_q = queue.Queue()
+# TCP keepalives and sequential SSL mode fallbacks are configured below.
+# This prevents serverless Neon DB instances from closing idle connections during cold starts.
+def get_conn():
+    if not config.DATABASE_URL:
+        st.error("❌ DATABASE_URL not set.")
+        return None
+    last_err = None
+    for sslmode in ("require", "prefer", "disable"):
+        try:
+            return psycopg2.connect(
+                config.DATABASE_URL, sslmode=sslmode,
+                connect_timeout=10,
+                keepalives=1, keepalives_idle=30,
+                keepalives_interval=5, keepalives_count=3,
+            )
+        except psycopg2.OperationalError as e:
+            last_err = e
+    st.error(f"❌ DB error: {last_err}")
+    return None
 
-if "wa_started" not in st.session_state:
-    threading.Thread(target=notifications._wa_worker, args=(st.session_state.wa_q,), daemon=True).start()
-    st.session_state.wa_started = True
+def _exec(sql, params=(), fetch=None, commit=False):
+    """Generic execution wrapper that handles connection life cycles, custom commits, and transaction rollbacks."""
+    conn = get_conn()
+    if not conn: return None
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+            c.execute(sql, params)
+            if commit: conn.commit()
+            if fetch == "one":  return c.fetchone()
+            if fetch == "all":  return c.fetchall()
+            if commit:          return True
+    except Exception as e:
+        print(f"[DB] {e}")
+        try: conn.rollback()
+        except: pass
+        return None
+    finally:
+        conn.close()
 
-# Tenant registration and login interface components
-def show_auth():
-    st.markdown("""
-    <h1 style='text-align:center;margin-top:60px'>🎓 Attendance Admin Portal</h1>
-    <p style='text-align:center;color:#888'>Multi-College · Subject-wise · Cloud Administration Panel</p><hr>
-    """, unsafe_allow_html=True)
-    t1, t2 = st.tabs(["🔐 Login","📝 Register College"])
-    with t1:
-        with st.form("lf"):
-            code=st.text_input("College Code"); pw=st.text_input("Password",type="password")
-            if st.form_submit_button("Login",use_container_width=True):
-                if code and pw:
-                    t=database.tenant_login(code,pw)
-                    if t: st.session_state.tenant=t; st.rerun()
-                    else: st.error("❌ Wrong code / password.")
-                else: st.warning("Fill both fields.")
-    with t2:
-        with st.form("rf"):
-            rn=st.text_input("College Name"); rc=st.text_input("Code (no spaces)")
-            rp=st.text_input("Password",type="password"); rp2=st.text_input("Confirm Password",type="password")
-            if st.form_submit_button("Register",use_container_width=True):
-                if not all([rn,rc,rp]): st.error("All fields required.")
-                elif ' ' in rc:         st.error("No spaces in code.")
-                elif rp!=rp2:           st.error("Passwords don't match.")
-                else:
-                    ok,msg=database.tenant_register(rn,rc,rp); (st.success if ok else st.error)(msg)
+def init_db():
+    conn = get_conn()
+    if not conn: return
+    try:
+        with conn.cursor() as c:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS tenants (
+                    id SERIAL PRIMARY KEY, name TEXT NOT NULL,
+                    code TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS students (
+                    id SERIAL PRIMARY KEY,
+                    tenant_id INT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL, roll_number TEXT NOT NULL,
+                    phone_number TEXT DEFAULT '',
+                    UNIQUE(tenant_id, roll_number)
+                );
+                CREATE TABLE IF NOT EXISTS subjects (
+                    id SERIAL PRIMARY KEY,
+                    tenant_id INT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL, UNIQUE(tenant_id, name)
+                );
+                CREATE TABLE IF NOT EXISTS attendance_log (
+                    id SERIAL PRIMARY KEY,
+                    student_id INT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                    date DATE NOT NULL DEFAULT CURRENT_DATE,
+                    subject TEXT NOT NULL DEFAULT 'General',
+                    status TEXT NOT NULL DEFAULT 'A',
+                    marked_at TIMESTAMPTZ,
+                    message_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                    UNIQUE(student_id, date, subject)
+                );
+            """)
+        conn.commit()
+    except Exception as e:
+        st.warning(f"init_db: {e}")
+    finally:
+        conn.close()
 
-# Setup schemas and check application credentials
-
-if "tenant" not in st.session_state:
-    show_auth(); st.stop()
-
-tenant = st.session_state.tenant
-tid    = tenant["id"]
-
-# Reset volatile session states to rebuild lists correctly on a new login event
-_att_boot = f"_att_boot_{tid}"
-if _att_boot not in st.session_state:
-    database.reset_today_attendance(tid)
-    st.session_state[_att_boot] = True
-    st.session_state.pop("att_df", None)
-    for k in [k for k in st.session_state if k.startswith("done_")]:
-        del st.session_state[k]
-
-# Sidebar configuration, logout handling, and dataset management
-st.sidebar.markdown(f"### 🏫 {tenant['name']}")
-st.sidebar.caption(f"Code: `{tenant['code']}`")
-if st.sidebar.button("🚪 Logout"):
-    for k in list(st.session_state): del st.session_state[k]
-    st.rerun()
-
-st.sidebar.markdown("---")
-page = st.sidebar.radio("📌 Navigation",[
-    "👥 Manage Students","📚 Manage Subjects","📊 History & Reports","🛠️ Recruiter Demo Tools"
-])
-
-# Student directory and registration interface
-if page=="👥 Manage Students":
-    st.title("👥 Manage Students")
-
-    # Fetch and display persistent transaction logs
-    if "_stu_msg" in st.session_state:
-        mtype, mtxt = st.session_state.pop("_stu_msg")
-        (st.success if mtype == "ok" else st.error)(mtxt)
-
-    c1, c2 = st.columns([1, 1])
-
-    with c1:
-        st.subheader("Add / Update Student")
-        with st.form("stu_form"):
-            sn = st.text_input("Full Name")
-            sr = st.text_input("Roll Number")
-            sp = st.text_input("Phone (+91...)")
-            if st.form_submit_button("💾 Save Student", use_container_width=True):
-                if sn and sr:
-                    ok, msg = database.save_student(tid, sn, sr, sp)
-                    st.session_state._stu_msg = ("ok" if ok else "err", msg)
-                    st.session_state.pop("att_df", None)
-                    st.rerun()
-                else:
-                    st.warning("Name + Roll required.")
-        st.caption("💡 Tip: Manage student records here. The local edge camera client will sync automatically with these records.")
-
-    with c2:
-        st.subheader("Student List")
-        df_s = database.get_students(tid)
-        if df_s.empty:
-            st.info("No students yet. Add one using the form.")
-        else:
-            st.dataframe(df_s, use_container_width=True, hide_index=True)
-
-            st.markdown("---")
-            st.markdown("**Delete a student:**")
-            roll_list = df_s["Roll"].tolist()
-            dr = st.selectbox("Select Roll Number", roll_list, key="del_roll_select")
-            matched = df_s[df_s["Roll"] == dr]
-            if not matched.empty:
-                st.caption(f"Selected: **{matched.iloc[0]['Name']}** — Roll {dr}")
-            if st.button("🗑️ Delete This Student", type="primary", use_container_width=True):
-                database.del_student(tid, dr)
-                st.session_state._stu_msg = ("ok", f"✅ Deleted student with roll **{dr}**")
-                st.session_state.pop("att_df", None)
-                st.rerun()
-
-# Course subject registration configuration page
-elif page=="📚 Manage Subjects":
-    st.title("📚 Manage Subjects")
-    subs=database.get_subjects(tid)
-    c1,c2=st.columns([1,1])
-    with c1:
-        st.subheader("Add Subject")
-        with st.form("asub"):
-            sn2=st.text_input("Subject Name",placeholder="e.g. Mathematics")
-            if st.form_submit_button("➕ Add"):
-                if sn2.strip(): ok,msg=database.add_subject(tid,sn2); (st.success if ok else st.error)(msg); st.rerun()
-                else: st.warning("Enter a name.")
-    with c2:
-        st.subheader("Current Subjects")
-        if not subs: st.info("No subjects yet.")
-        else:
-            for s in subs:
-                cs1,cs2=st.columns([3,1])
-                cs1.write(f"📖 {s}")
-                if cs2.button("🗑️",key=f"ds_{s}"):
-                    database.del_subject(tid,s); st.rerun()
-
-# Archive search, filtering, and reporting modules
-elif page=="📊 History & Reports":
-    st.title("📊 History & Reports")
-    subs=database.get_subjects(tid)
-    if not subs: st.warning("Add subjects first."); st.stop()
-    c1,c2=st.columns(2)
-    with c1: hd=st.date_input("📅 Date",datetime.date.today())
-    with c2: hs=st.selectbox("📚 Subject",subs)
-    df_h=database.load_history(tid,hd,hs)
-    if df_h.empty: st.info(f"No data for **{hs}** on **{hd}**.")
-    else:
-        tot=len(df_h); pc=(df_h['Status']=='P').sum(); ac=(df_h['Status']=='A').sum()
-        m1,m2,m3=st.columns(3); m1.metric("👥 Total",tot); m2.metric("✅ Present",pc); m3.metric("❌ Absent",ac)
-        st.markdown(f"### {hs} — {hd.strftime('%d %b %Y')}")
-        st.dataframe(df_h.style.map(ui._badge,subset=['Status']),use_container_width=True,hide_index=True)
-        st.download_button("⬇️ Download CSV",df_h.to_csv(index=False).encode(),
-                           f"attendance_{hs}_{hd}.csv","text/csv")
-
-# Recruiter & Demo Simulator Section
-elif page == "🛠️ Recruiter Demo Tools":
-    st.title("🛠️ Recruiter Demo Tools")
-    st.markdown("""
-    Welcome to the **Developer Demo Control Panel**. Since this cloud-deployed web app is an administration panel 
-    and doesn't directly run a physical camera, you can use these tools to simulate the entire end-to-end pipeline 
-    (Database insertions, real-time status updates, and WhatsApp notifications).
-    """)
-    
-    st.info("""
-    📢 **Live WhatsApp Alert Test Instructions (For Recruiters):**
-    To receive a real, active WhatsApp attendance alert on your personal phone, please follow these steps:
-    1. Open WhatsApp on your phone and send **`join peace-original`** to **`+14155238886`** once.
-    2. Register your name and phone number under the **Manage Students** tab (or populate mock data below).
-    3. Use the Simulation Panel below to trigger a successful match event!
-    """)
-    st.markdown("---")
-    
-    c1, c2 = st.columns([1, 1])
-    
-    with c1:
-        st.subheader("1. Populate PostgreSQL with Mock Data")
-        st.write("Clicking this button will seed your Neon PostgreSQL tables with a list of mock students, courses, and generated attendance logs. This lets you inspect populated data in other tabs immediately.")
-        if st.button("📥 Seeding Mock Database", use_container_width=True):
-            with st.spinner("Populating tables..."):
-                ok, msg = database.generate_mock_data(tid)
-                if ok:
-                    st.success(msg)
-                    st.session_state.pop("att_df", None)
-                else:
-                    st.error(msg)
-    
-    with c2:
-        st.subheader("2. Simulate Face Match & Twilio Alerts")
-        st.write("Select a registered student and subject below to manually simulate a successful face recognition match. This will mark the student **Present** in the database and trigger a real WhatsApp alert using Twilio.")
+def generate_mock_data(tid):
+    """Populates PostgreSQL with realistic mock students, subjects, and logs for recruitment demo purposes."""
+    conn = get_conn()
+    if not conn: return False, "No Database Connection"
+    try:
+        with conn.cursor() as c:
+            # 1. Insert Mock Subjects
+            subjects = ["Computer Science", "Mathematics", "Physics"]
+            for sub in subjects:
+                c.execute("INSERT INTO subjects(tenant_id,name) VALUES(%s,%s) ON CONFLICT DO NOTHING", (tid, sub))
+            
+            # 2. Insert Mock Students
+            students = [
+                ("VINEET KUMAR", "101", "+919999999999"),
+                ("RAMESH SHARMA", "102", "+918888888888"),
+                ("PRIYA PATEL", "103", "+917777777777"),
+                ("AMIT SINGH", "104", "+916666666666"),
+                ("SARA KHAN", "105", "")
+            ]
+            for name, roll, phone in students:
+                c.execute("""
+                    INSERT INTO students(tenant_id,name,roll_number,phone_number)
+                    VALUES(%s,%s,%s,%s) ON CONFLICT(tenant_id,roll_number) DO NOTHING
+                """, (tid, name, roll, phone))
+            
+            conn.commit()
+            
+            # Fetch active student IDs
+            c.execute("SELECT id FROM students WHERE tenant_id=%s", (tid,))
+            student_ids = [r[0] for r in c.fetchall()]
+            
+            # 3. Create mock today's logs with different statuses
+            today = datetime.date.today()
+            for idx, sid in enumerate(student_ids):
+                status_cs = "P" if idx % 2 == 0 else "A"
+                c.execute("""
+                    INSERT INTO attendance_log(student_id,date,subject,status,marked_at)
+                    VALUES(%s,%s,%s,%s,NOW())
+                    ON CONFLICT(student_id,date,subject) DO UPDATE SET status=%s, marked_at=NOW()
+                """, (sid, today, "Computer Science", status_cs, status_cs))
+                
+                status_math = "P" if idx % 3 == 0 else "A"
+                c.execute("""
+                    INSERT INTO attendance_log(student_id,date,subject,status,marked_at)
+                    VALUES(%s,%s,%s,%s,NOW())
+                    ON CONFLICT(student_id,date,subject) DO UPDATE SET status=%s, marked_at=NOW()
+                """, (sid, today, "Mathematics", status_math, status_math))
         
-        df_s = database.get_students(tid)
-        subs = database.get_subjects(tid)
-        
-        if df_s.empty or not subs:
-            st.warning("⚠️ Please populate mock data first using the left panel or register a student/subject.")
-        else:
-            student_list = []
-            for idx, r in df_s.iterrows():
-                student_list.append(f"{r['Name']} (Roll: {r['Roll']})")
-            
-            sel_student = st.selectbox("Select Student to Simulate", student_list)
-            sel_sub = st.selectbox("Select Subject", subs)
-            
-            # Extract raw parameters safely
-            try:
-                roll_part = sel_student.split("(Roll: ")[1].replace(")", "").strip()
-                name_part = sel_student.split(" (Roll:")[0].strip()
-            except IndexError:
-                roll_part = ""
-                name_part = ""
-            
-            if st.button("⚡ Trigger Swipe & Send WhatsApp Alert", use_container_width=True):
-                if roll_part and sel_sub:
-                    with st.spinner("Processing trigger..."):
-                        label_format = f"{name_part.replace(' ', '_')}_{roll_part}"
-                        
-                        sk = f"done_{sel_sub}_{roll_part}"
-                        st.session_state.pop(sk, None)
-                        
-                        ok, phone = database.mark_present(tid, sel_sub, label_format)
-                        if ok:
-                            st.success(f"🎯 Successfully marked {name_part} (Roll: {roll_part}) as PRESENT!")
-                            st.session_state.att_df = database.load_attendance(tid, sel_sub)
-                            if phone:
-                                st.session_state.wa_q.put((phone, name_part, sel_sub, tid, label_format))
-                                st.info(f"📨 WhatsApp alert queued for registered parent number: `{phone}`")
-                            else:
-                                st.warning("⚠️ Attendance marked, but no phone number found or message already dispatched.")
-                        else:
-                            st.warning("ℹ️ Already marked Present for this subject today.")
-                else:
-                    st.error("Error parsing student parameters.")
+        conn.commit()
+        return True, "✅ Successfully seeded mock subjects, students, and attendance logs!"
+    except Exception as e:
+        return False, f"DB Error: {e}"
+    finally:
+        conn.close()
+
+# --- Authentication and Tenant Registration ---
+def _hash(pw): return hashlib.sha256(pw.encode()).hexdigest()
+
+def tenant_register(name, code, pw):
+    conn = get_conn()
+    if not conn: return False, "No DB"
+    try:
+        with conn.cursor() as c:
+            c.execute("INSERT INTO tenants(name,code,password_hash) VALUES(%s,%s,%s)",
+                      (name.strip(), code.strip().upper(), _hash(pw)))
+        conn.commit(); return True, "✅ Registered!"
+    except psycopg2.errors.UniqueViolation:
+        return False, "Code already taken."
+    except Exception as e:
+        return False, str(e)
+    finally: conn.close()
+
+def tenant_login(code, pw):
+    row = _exec(
+        "SELECT id,name,code FROM tenants WHERE code=%s AND password_hash=%s",
+        (code.strip().upper(), _hash(pw)), fetch="one"
+    )
+    return dict(row) if row else None
+
+# --- Course and Subject Records Management ---
+def get_subjects(tid):
+    rows = _exec("SELECT name FROM subjects WHERE tenant_id=%s ORDER BY name",
+                 (tid,), fetch="all")
+    return [r["name"] for r in rows] if rows else []
+
+def add_subject(tid, name):
+    ok = _exec("INSERT INTO subjects(tenant_id,name) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+               (tid, name.strip()), commit=True)
+    return (True,"Added!") if ok is not None else (False,"DB error")
+
+def del_subject(tid, name):
+    _exec("DELETE FROM subjects WHERE tenant_id=%s AND name=%s", (tid,name), commit=True)
+
+# --- Student Identity Parsing and Record Keeping ---
+def _roll(lbl):
+    if '_' in lbl:
+        suf = lbl.rsplit('_',1)[-1]
+        if suf.isdigit(): return suf
+    return f"NR-{lbl.upper()}"
+
+def _disp(lbl): return (lbl.split('_')[0] if '_' in lbl else lbl).upper()
+
+def _name(lbl):
+    return (lbl.split('_')[0] if '_' in lbl else lbl).upper()
+
+def _has_roll_in_label(lbl):
+    return '_' in lbl and lbl.rsplit('_', 1)[-1].isdigit()
+
+def _find_student(c, tid, label):
+    roll = _roll(label)
+    nm   = _name(label)
+    c.execute(
+        "SELECT COUNT(*) FROM students WHERE tenant_id=%s AND UPPER(name)=%s",
+        (tid, nm),
+    )
+    name_count = c.fetchone()[0]
+    if name_count > 1 or _has_roll_in_label(label):
+        c.execute(
+            "SELECT id,phone_number FROM students WHERE tenant_id=%s AND roll_number=%s",
+            (tid, roll),
+        )
+        row = c.fetchone()
+        if row:
+            return row
+    if name_count >= 1:
+        c.execute(
+            "SELECT id,phone_number FROM students WHERE tenant_id=%s AND UPPER(name)=%s",
+            (tid, nm),
+        )
+        row = c.fetchone()
+        if row:
+            return row
+    c.execute(
+        "SELECT id,phone_number FROM students WHERE tenant_id=%s AND roll_number=%s",
+        (tid, roll),
+    )
+    return c.fetchone()
+
+def get_students(tid):
+    conn = get_conn()
+    if not conn: return pd.DataFrame()
+    try:
+        return pd.read_sql_query(
+            'SELECT name AS "Name", roll_number AS "Roll", phone_number AS "Phone" '
+            'FROM students WHERE tenant_id=%s ORDER BY name', conn, params=(tid,))
+    finally: conn.close()
+
+def save_student(tid, name, roll, phone=""):
+    ok = _exec("""INSERT INTO students(tenant_id,name,roll_number,phone_number)
+                  VALUES(%s,%s,%s,%s)
+                  ON CONFLICT(tenant_id,roll_number)
+                  DO UPDATE SET name=EXCLUDED.name, phone_number=EXCLUDED.phone_number""",
+               (tid, name.upper().strip(), str(roll).strip(), str(phone).strip()),
+               commit=True)
+    return (True,"Saved!") if ok is not None else (False,"DB error")
+
+def del_student(tid, roll):
+    """Deletes a student record safely from the cloud database without managing local file deletion."""
+    roll = str(roll).strip()
+    _exec("DELETE FROM students WHERE tenant_id=%s AND roll_number=%s",
+          (tid, roll), commit=True)
+
+def ensure_students(tid, class_names):
+    if not class_names:
+        return
+    conn = get_conn()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as c:
+            for lbl in class_names:
+                nm   = _name(lbl)
+                roll = _roll(lbl)
+                if _has_roll_in_label(lbl):
+                    c.execute(
+                        """INSERT INTO students(tenant_id,name,roll_number)
+                           VALUES(%s,%s,%s) ON CONFLICT(tenant_id,roll_number) DO NOTHING""",
+                        (tid, nm, roll),
+                    )
+                    continue
+                c.execute(
+                    "SELECT 1 FROM students WHERE tenant_id=%s AND UPPER(name)=%s",
+                    (tid, nm),
+                )
+                if c.fetchone():
+                    continue
+                c.execute(
+                    """INSERT INTO students(tenant_id,name,roll_number)
+                       VALUES(%s,%s,%s) ON CONFLICT(tenant_id,roll_number) DO NOTHING""",
+                    (tid, nm, roll),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+# --- Attendance Tracking and Logging Operations ---
+def load_attendance(tid, subject, date=None):
+    conn = get_conn()
+    if not conn: return pd.DataFrame(columns=['Name','Roll','Phone','Status'])
+    try:
+        d = date or datetime.date.today()
+        return pd.read_sql_query("""
+            SELECT s.name AS "Name", s.roll_number AS "Roll",
+                   s.phone_number AS "Phone",
+                   COALESCE(a.status,'A') AS "Status"
+            FROM   students s
+            LEFT JOIN attendance_log a
+                   ON a.student_id=s.id AND a.date=%s AND a.subject=%s
+            WHERE  s.tenant_id=%s ORDER BY s.name
+        """, conn, params=(d, subject, tid))
+    except Exception as e:
+        print(f"[load_attendance] {e}")
+        return pd.DataFrame(columns=['Name', 'Roll', 'Phone', 'Status'])
+    finally:
+        conn.close()
+
+load_data = load_attendance
+
+def reset_today_attendance(tid, subject=None):
+    conn = get_conn()
+    if not conn:
+        return
+    try:
+        today = datetime.date.today()
+        with conn.cursor() as c:
+            if subject:
+                c.execute("""
+                    DELETE FROM attendance_log a
+                    USING students s
+                    WHERE a.student_id = s.id AND s.tenant_id = %s
+                      AND a.date = %s AND a.subject = %s
+                """, (tid, today, subject))
+            else:
+                c.execute("""
+                    DELETE FROM attendance_log a
+                    USING students s
+                    WHERE a.student_id = s.id AND s.tenant_id = %s
+                      AND a.date = %s
+                """, (tid, today))
+        conn.commit()
+    except Exception as e:
+        print(f"[reset_today_attendance] {e}")
+    finally:
+        conn.close()
+
+def mark_present(tid, subject, label):
+    roll = _roll(label)
+    sk   = f"done_{subject}_{roll}"
+    if st.session_state.get(sk): return False, None
+    conn = get_conn()
+    if not conn: return False, None
+    try:
+        today = datetime.date.today()
+        with conn.cursor() as c:
+            row = _find_student(c, tid, label)
+            if not row:
+                c.execute(
+                    "INSERT INTO students(tenant_id,name,roll_number) VALUES(%s,%s,%s) RETURNING id,phone_number",
+                    (tid, _name(label), roll),
+                )
+                sid, phone = c.fetchone()
+                conn.commit()
+            else:
+                sid, phone = row
+        with conn.cursor() as c:
+            c.execute("SELECT status,message_sent FROM attendance_log "
+                      "WHERE student_id=%s AND date=%s AND subject=%s",
+                      (sid, today, subject))
+            ex = c.fetchone()
+        if ex and ex[0]=='P':
+            st.session_state[sk]=True; return False, None
+        with conn.cursor() as c:
+            c.execute("""INSERT INTO attendance_log(student_id,date,subject,status,marked_at,message_sent)
+                         VALUES(%s,%s,%s,'P',NOW(),FALSE)
+                         ON CONFLICT(studen
