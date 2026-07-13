@@ -84,6 +84,61 @@ def init_db():
     finally:
         conn.close()
 
+def generate_mock_data(tid):
+    """Populates PostgreSQL with realistic mock students, subjects, and logs for recruitment demo purposes."""
+    conn = get_conn()
+    if not conn: return False, "No Database Connection"
+    try:
+        with conn.cursor() as c:
+            # 1. Insert Mock Subjects
+            subjects = ["Computer Science", "Mathematics", "Physics"]
+            for sub in subjects:
+                c.execute("INSERT INTO subjects(tenant_id,name) VALUES(%s,%s) ON CONFLICT DO NOTHING", (tid, sub))
+            
+            # 2. Insert Mock Students
+            students = [
+                ("VINEET KUMAR", "101", "+919999999999"),
+                ("RAMESH SHARMA", "102", "+918888888888"),
+                ("PRIYA PATEL", "103", "+917777777777"),
+                ("AMIT SINGH", "104", "+916666666666"),
+                ("SARA KHAN", "105", "")
+            ]
+            for name, roll, phone in students:
+                c.execute("""
+                    INSERT INTO students(tenant_id,name,roll_number,phone_number)
+                    VALUES(%s,%s,%s,%s) ON CONFLICT(tenant_id,roll_number) DO NOTHING
+                """, (tid, name, roll, phone))
+            
+            conn.commit()
+            
+            # Fetch active student IDs
+            c.execute("SELECT id FROM students WHERE tenant_id=%s", (tid,))
+            student_ids = [r[0] for r in c.fetchall()]
+            
+            # 3. Create mock today's logs with different statuses
+            today = datetime.date.today()
+            for idx, sid in enumerate(student_ids):
+                status_cs = "P" if idx % 2 == 0 else "A"
+                c.execute("""
+                    INSERT INTO attendance_log(student_id,date,subject,status,marked_at)
+                    VALUES(%s,%s,%s,%s,NOW())
+                    ON CONFLICT(student_id,date,subject) DO UPDATE SET status=%s, marked_at=NOW()
+                """, (sid, today, "Computer Science", status_cs, status_cs))
+                
+                status_math = "P" if idx % 3 == 0 else "A"
+                c.execute("""
+                    INSERT INTO attendance_log(student_id,date,subject,status,marked_at)
+                    VALUES(%s,%s,%s,%s,NOW())
+                    ON CONFLICT(student_id,date,subject) DO UPDATE SET status=%s, marked_at=NOW()
+                """, (sid, today, "Mathematics", status_math, status_math))
+        
+        conn.commit()
+        return True, "✅ Successfully seeded mock subjects, students, and attendance logs!"
+    except Exception as e:
+        return False, f"DB Error: {e}"
+    finally:
+        conn.close()
+
 # --- Authentication and Tenant Registration ---
 def _hash(pw): return hashlib.sha256(pw.encode()).hexdigest()
 
@@ -138,7 +193,6 @@ def _has_roll_in_label(lbl):
     return '_' in lbl and lbl.rsplit('_', 1)[-1].isdigit()
 
 def _find_student(c, tid, label):
-    """Resolves database student IDs dynamically. Prioritizes roll numbers parsed from photo naming conventions to resolve duplicate first names."""
     roll = _roll(label)
     nm   = _name(label)
     c.execute(
@@ -246,10 +300,9 @@ def load_attendance(tid, subject, date=None):
     finally:
         conn.close()
 
-load_data = load_attendance  # Alias maps for deprecated interfaces
+load_data = load_attendance
 
 def reset_today_attendance(tid, subject=None):
-    """Removes historical data for the current date to prevent session caching overlaps on restart."""
     conn = get_conn()
     if not conn:
         return
@@ -277,7 +330,6 @@ def reset_today_attendance(tid, subject=None):
         conn.close()
 
 def mark_present(tid, subject, label):
-    """Flags targeted student rows as 'P' (Present). Returns validation status and associated phone records for SMS queues."""
     roll = _roll(label)
     sk   = f"done_{subject}_{roll}"
     if st.session_state.get(sk): return False, None
