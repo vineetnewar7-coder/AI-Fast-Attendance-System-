@@ -166,7 +166,7 @@ elif page=="📊 History & Reports":
         st.markdown(f"### {hs} — {hd.strftime('%d %b %Y')}")
         st.dataframe(df_h.style.map(ui._badge,subset=['Status']),use_container_width=True,hide_index=True)
         st.download_button("⬇️ Download CSV",df_h.to_csv(index=False).encode(),
-                           f"attendance_{hs}_{hd}.csv","text/csv")
+                                   f"attendance_{hs}_{hd}.csv","text/csv")
 
 # Recruiter & Demo Simulator Section
 elif page == "🛠️ Recruiter Demo Tools":
@@ -176,6 +176,29 @@ elif page == "🛠️ Recruiter Demo Tools":
     and doesn't directly run a physical camera, you can use these tools to simulate the entire end-to-end pipeline 
     (Database insertions, real-time status updates, and WhatsApp notifications).
     """)
+    
+    # Beautiful, custom-designed alert step panel
+    st.markdown("""
+    <div style="background-color:#1e293b; padding:20px; border-radius:10px; border-left:5px solid #10b981; margin-bottom:25px;">
+        <h4 style="color:#10b981; margin-top:0;">📲 Test Live WhatsApp Alerts (Real-Time Sandbox Integration)</h4>
+        <p style="color:#cbd5e1; margin-bottom:15px;">To receive a live attendance alert on your personal phone, follow these three quick steps:</p>
+        <ol style="color:#cbd5e1; margin-left:20px; padding-left:0;">
+            <li style="margin-bottom:10px;">
+                <strong>Step 1: Open WhatsApp Chat</strong><br>
+                Click this link to open the official Twilio Sandbox chat instantly: 
+                <a href="https://wa.me/14155238886" target="_blank" style="color:#34d399; font-weight:bold; text-decoration:underline;">wa.me/14155238886</a> (No need to save the number).
+            </li>
+            <li style="margin-bottom:10px;">
+                <strong>Step 2: Join the Sandbox</strong><br>
+                Send the exact message <code style="background-color:#0f172a; padding:3px 6px; border-radius:4px; color:#f43f5e; font-weight:bold;">join peace-original</code> to link your WhatsApp number to this project.
+            </li>
+            <li>
+                <strong>Step 3: Trigger the Simulator</strong><br>
+                Add yourself under <strong>Manage Students</strong> (with country code, e.g. <i>+91...</i>) or use the <strong>Simulator Panel</strong> below to send a real alert!
+            </li>
+        </ol>
+    </div>
+    """, unsafe_allow_html=True)
     st.markdown("---")
     
     c1, c2 = st.columns([1, 1])
@@ -189,6 +212,7 @@ elif page == "🛠️ Recruiter Demo Tools":
                 if ok:
                     st.success(msg)
                     st.session_state.pop("att_df", None)
+                    st.info("💡 Note: Check the 'Manage Students' and 'History & Reports' tabs above to verify the generated records inside the database.")
                 else:
                     st.error(msg)
     
