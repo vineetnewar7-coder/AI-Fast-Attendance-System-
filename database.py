@@ -91,15 +91,13 @@ def generate_mock_data(tid):
     try:
         with conn.cursor() as c:
             # 1. Insert Mock Subjects
-            subjects = ["Computer Science", "Mathematics", "Physics"]
+            subjects = ["Computer Science"]
             for sub in subjects:
                 c.execute("INSERT INTO subjects(tenant_id,name) VALUES(%s,%s) ON CONFLICT DO NOTHING", (tid, sub))
             
             # 2. Insert Mock Students
             students = [
                 ("VINEET KUMAR", "101", "+919999999999"),
-                ("RAMESH SHARMA", "102", "+918888888888"),
-                ("PRIYA PATEL", "103", "+917777777777"),
                 ("AMIT SINGH", "104", "+916666666666")
             ]
             for name, roll, phone in students:
