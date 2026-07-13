@@ -100,8 +100,7 @@ def generate_mock_data(tid):
                 ("VINEET KUMAR", "101", "+919999999999"),
                 ("RAMESH SHARMA", "102", "+918888888888"),
                 ("PRIYA PATEL", "103", "+917777777777"),
-                ("AMIT SINGH", "104", "+916666666666"),
-                ("SARA KHAN", "105", "")
+                ("AMIT SINGH", "104", "+916666666666")
             ]
             for name, roll, phone in students:
                 c.execute("""
